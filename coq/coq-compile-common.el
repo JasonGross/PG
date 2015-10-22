@@ -12,7 +12,6 @@
 ;; the compilation feature.
 ;;
 
-
 (require 'proof-shell)
 
 (eval-when (compile)
@@ -29,10 +28,15 @@
 ;; constants
 
 (defun get-coq-library-directory ()
-  (let ((c (substring (shell-command-to-string "coqtop -where") 0 -1 )))
-    (if (string-match c "not found")
-        "/usr/local/lib/coq"
-      c)))
+  "Find Coq's library directory.
+Defaults to /usr/local/lib/coq."
+  (let* ((prover proof-prog-name)
+         (cmd (and proof-prog-name (concat (shell-quote-argument prover) " -where")))
+         (output (and cmd (with-demoted-errors (shell-command-to-string cmd))))
+         (libdir (and output (replace-regexp-in-string "[\r\n]+\\'" "" output))))
+    (if (and libdir (file-exists-p libdir))
+        libdir
+      "/usr/local/lib/coq")))
 
 (defconst coq-library-directory (get-coq-library-directory)
   "The coq library directory, as reported by \"coqtop -where\".")

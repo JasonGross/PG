@@ -275,8 +275,6 @@ FILE should be an absolute file name. It can be nil if
 ;; (??). Is it interfering with defpgcustom's in pg-custom.el?
 (defun coq-prog-args () (coq-coqtop-prog-args))
 
-
-
 (defcustom coq-use-project-file t
   "If t, when opening a coq file read the dominating _CoqProject.
 If t when a coq file is opened, proofgeneral will look for a
@@ -390,32 +388,116 @@ allows to call coqtop from a subdirectory of the project."
    (coq-read-option-from-project-file projectbuffer coq-prog-args-regexp)))
 
 
+(defconst coq--project-file-separator "[\r\n[:space:]]+")
+
+(defconst coq--makefile-switch-arities
+  '(("-R" . 2)
+    ("-Q" . 2)
+    ("-I" . 1)
+    ("-arg" . 1)
+    ("-opt" . 0)
+    ("-byte" . 0)))
+
+(defun coq--read-one-option-from-project-file (switch arity raw-args)
+  "Cons SWITCH with ARITY arguments from RAW-ARGS.
+If ARITY is nil, return SWITCH."
+  (if arity
+      (let ((arguments
+             (condition-case-unless-debug nil
+                 (cl-subseq raw-args 0 arity)
+               (warn "Invalid _CoqProject: not enough arguments for %S" switch))))
+        (cons switch arguments))
+    switch))
+
+(defun coq--read-options-from-project-file (contents)
+  "Read options from CONTENTS of _CoqProject.
+Returns a mixed list of option-value pairs and strings."
+  (let ((raw-args (split-string-and-unquote contents coq--project-file-separator))
+        (options nil))
+    (while raw-args
+      (let* ((switch (pop raw-args))
+             (arity (cdr (assoc switch coq--makefile-switch-arities))))
+        (push (coq--read-one-option-from-project-file switch arity raw-args) options)
+        (setq raw-args (nthcdr (or arity 0) raw-args))))
+    options))
+
+(defun coq--extract-prog-args (options)
+  "Extract coqtop arguments from _CoqProject options OPTIONS.
+OPTIONS is a list or conses (switch . argument) and strings.
+Note that the semantics of the -arg flags in coq project files
+are weird: -arg \"a b\" means pass a and b, separately, to
+coqtop."
+  (let ((args nil))
+    (dolist (opt options)
+      (pcase opt
+        ((or "-byte" "-op")
+         (push opt args))
+        (`("-arg" ,concatenated-args)
+         (setq args
+               (append (split-string (cadr opt) coq--project-file-separator)
+                       args)))))
+    (cons "-emacs" args)))
+
+(defun coq--extract-load-path (options base-directory)
+  "Extract loadpath from _CoqProject options OPTIONS.
+OPTIONS is a list or conses (switch . arguments) and strings.
+Paths are taken relative to BASE-DIRECTORY."
+  (let ((load-path nil))
+    (dolist (opt options)
+      (pcase opt
+        (`("-I" ,path)
+         (push (list 'ocamlimport (expand-file-name path base-directory))
+               load-path))
+        (`("-R" ,path ,alias)
+         (push (list 'rec (expand-file-name path base-directory) alias)
+               load-path))
+        (`("-Q" ,path "")
+         (push (list 'norec (expand-file-name path base-directory))
+               load-path))
+        (`("-Q" ,path ,alias)
+         (push (list 'recnoimport (expand-file-name path base-directory) alias)
+               load-path))))
+    load-path))
+
+(defun coq-test-project-refactoring ()
+  (interactive)
+  (let* ((contents (buffer-substring (point-min) (point-max)))
+         (options (coq--read-options-from-project-file contents))
+         (args (coq--extract-prog-args options))
+         (path (coq--extract-load-path options (file-name-directory (buffer-file-name)))))
+    (message "Before: %S -> After: %S\nBefore: %S -> After: %S"
+             (coq-search-prog-args (current-buffer)) args
+             (coq-search-load-path (current-buffer)) path)))
+
 ;; optional args allow to implement the precedence of dir/file local vars
 (defun coq-load-project-file-with-avoid (&optional avoidargs avoidpath)
-  (let* ((projectbuffer-aux (coq-find-project-file))
-         (projectbuffer (and projectbuffer-aux (car projectbuffer-aux)))
-         (no-kill (and projectbuffer-aux (car (cdr projectbuffer-aux)))))
-    (if (not projectbuffer-aux)
+  "Set `coq-prog-args' and `coq-load-path' from _CoqProject.
+If AVOIDARGS or AVOIDPATH is set, do not set the corresponding
+variable."
+  (pcase-let* (((seq proj-file-buf no-kill) (coq-find-project-file)))
+    (if (not proj-file-buf)
         (message "Coq project file not detected.")
-      (unless avoidargs (setq coq-prog-args (coq-search-prog-args projectbuffer)))
-      (unless avoidpath (setq coq-load-path (coq-search-load-path projectbuffer)))
-      (let ((msg
-             (cond
-              ((and avoidpath avoidargs) "Coqtop args and load path")
-              (avoidpath "Coqtop load path")
-              (avoidargs "Coqtop args")
-              (t ""))))
-        (message
-         "Coq project file detected: %s%s." (buffer-file-name projectbuffer)
-         (if (or avoidpath avoidargs)
-             (concat "\n(" msg " overridden by dir/file local values)")
-           "")))
-      (when coq-debug
-        (message "coq-prog-args: %S" coq-prog-args)
-        (message "coq-load-path: %S" coq-load-path))
-      (unless no-kill (kill-buffer projectbuffer)))))
-
-
+      (let* ((contents (with-current-buffer proj-file-buf (buffer-string)))
+             (options (coq--read-options-from-project-file contents))
+             (proj-file-name (buffer-file-name proj-file-buf))
+             (proj-file-dir (file-name-directory proj-file-name)))
+        (unless avoidargs (setq coq-prog-args (coq--extract-prog-args options)))
+        (unless avoidpath (setq coq-load-path (coq--extract-load-path options proj-file-dir)))
+        (let ((msg
+               (cond
+                ((and avoidpath avoidargs) "Coqtop args and load path")
+                (avoidpath "Coqtop load path")
+                (avoidargs "Coqtop args")
+                (t ""))))
+          (message
+           "Coq project file detected: %s%s." proj-file-name
+           (if (or avoidpath avoidargs)
+               (concat "\n(" msg " overridden by dir/file local values)")
+             "")))
+        (when coq-debug
+          (message "coq-prog-args: %S" coq-prog-args)
+          (message "coq-load-path: %S" coq-load-path))
+        (unless no-kill (kill-buffer proj-file-buf))))))
 
 (defun coq-load-project-file ()
   "Set `coq-prog-args' and `coq-load-path' according to _CoqProject file.
@@ -502,11 +584,11 @@ then be set using local file variables."
       coq-prog-name
     (let* ((dir (or (file-name-directory filename) "."))
            (makedir
-           (cond
-            ((file-exists-p (concat dir "Makefile")) ".")
-            ;; ((file-exists-p (concat dir "../Makefile")) "..")
-            ;; ((file-exists-p (concat dir "../../Makefile")) "../..")
-            (t nil))))
+            (cond
+             ((file-exists-p (concat dir "Makefile")) ".")
+             ;; ((file-exists-p (concat dir "../Makefile")) "..")
+             ;; ((file-exists-p (concat dir "../../Makefile")) "../..")
+             (t nil))))
       (if (and coq-use-makefile makedir)
           (let*
               ;;TODO, add dir name when makefile is in .. or ../..
